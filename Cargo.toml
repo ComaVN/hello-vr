@@ -1,0 +1,12 @@
+[package]
+name = "hello-vr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+ash = "0.38"
+ctrlc = "3"
+glam = "0.34"
+naga = { version = "30", features = ["wgsl-in", "spv-out"] }
+openxr = { version = "0.22", features = ["loaded"] }
