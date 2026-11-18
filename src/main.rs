@@ -4,9 +4,10 @@
 //! It renders a rotating cube floating above a floor quad, plus a floating
 //! button that can be pointed at with either controller's laser and clicked
 //! with the trigger to show the first of a series of stereoscopic photos.
-//! Each photo fills the view: each eye sees its own image of a left/right
-//! pair, fixed to the head and covering the camera's field of view, as in a
-//! stereo viewer. While a photo is shown, any trigger click moves to the next
+//! Each photo replaces the room: each eye sees its own image of a left/right
+//! pair, covering the camera's field of view. The photo appears straight
+//! ahead and stays put in the room as the head turns, as if infinitely far
+//! away. While a photo is shown, any trigger click moves to the next
 //! one, and after the last back to the room. Both eyes are drawn
 //! in a single pass using Vulkan multiview. The shader lives in
 //! `src/shaders/scene.wgsl` and is compiled to SPIR-V at startup with naga, so
@@ -522,6 +523,8 @@ fn main() -> Result<()> {
         let start = Instant::now();
         // Index into `photos` of the photo on show, or None for the room.
         let mut shown: Option<usize> = None;
+        // Direction the photo on show faces, fixed in the room when it appears.
+        let mut photo_heading = Quat::IDENTITY;
 
         println!("entering main loop; press Ctrl-C to exit");
         'main: loop {
@@ -639,8 +642,13 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            let eye_rotation = [pose_rotation(views[0].pose), pose_rotation(views[1].pose)];
             if let Some(path) = clicked_hand {
                 shown = next_photo(shown, photo_count);
+                // Each photo appears straight ahead and level, wherever the
+                // user is looking (the button is below eye level), then stays
+                // put in the room as the head turns.
+                photo_heading = level_heading(eye_rotation[0].slerp(eye_rotation[1], 0.5));
                 input.haptic.apply_feedback(
                     &session,
                     path,
@@ -664,17 +672,15 @@ fn main() -> Result<()> {
             let floor_push = push(Mat4::IDENTITY);
             // Text hangs above the cube, facing the user at the origin.
             let text_push = push(Mat4::from_translation(Vec3::new(0.0, 2.05, -1.5)));
-            // The photo is fixed to the head and rotation-only, as if
+            // The photo is fixed in direction but rotation-only, as if
             // infinitely far away: the depth is already in the difference
             // between the two images, so eye position must not add parallax.
-            // Each eye gets the same head-relative placement, so the two
-            // photos stay parallel like the cameras that took them.
+            // Both eyes get the same placement, so the two photos stay
+            // parallel like the cameras that took them.
             let photo_push = shown.map(|i| {
                 let photo = &photos[i];
-                let eye_rotation = [pose_rotation(views[0].pose), pose_rotation(views[1].pose)];
-                let head_rotation = eye_rotation[0].slerp(eye_rotation[1], 0.5);
                 let photo_world =
-                    Mat4::from_quat(head_rotation) * photo_model(photo.aspect, photo.long_side_fov);
+                    Mat4::from_quat(photo_heading) * photo_model(photo.aspect, photo.long_side_fov);
                 PushConstants {
                     mvp: [0, 1].map(|eye| {
                         (projection(views[eye].fov)
@@ -1133,6 +1139,18 @@ fn ray_box_hit(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     (enter <= exit && exit >= 0.0).then_some(enter.max(0.0))
 }
 
+/// The yaw part of `rotation`: a rotation about the vertical axis that faces
+/// the same compass direction, with no pitch or roll.
+fn level_heading(rotation: Quat) -> Quat {
+    let forward = rotation * Vec3::NEG_Z;
+    // Looking straight up or down leaves no horizontal direction; keep facing
+    // -Z rather than picking an arbitrary one.
+    if forward.x.abs() < 1e-4 && forward.z.abs() < 1e-4 {
+        return Quat::IDENTITY;
+    }
+    Quat::from_rotation_y(f32::atan2(-forward.x, -forward.z))
+}
+
 /// What a button click shows after `current` (None is the room): the next
 /// photo, or the room again after the last one.
 fn next_photo(current: Option<usize>, count: usize) -> Option<usize> {
@@ -1199,6 +1217,7 @@ fn projection(fov: xr::Fovf) -> Mat4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::FRAC_PI_2;
 
     #[test]
     fn shaders_compile() {
@@ -1260,6 +1279,18 @@ mod tests {
         let top = model.transform_point3(Vec3::Y);
         assert!((top.y.atan2(-top.z) - fov / 2.0).abs() < 1e-5);
         assert!((right.x / top.y - aspect).abs() < 1e-5);
+    }
+
+    #[test]
+    fn level_heading_drops_pitch_and_roll() {
+        let yaw = 0.7;
+        let tilted =
+            Quat::from_rotation_y(yaw) * Quat::from_rotation_x(-0.5) * Quat::from_rotation_z(0.3);
+        assert!(level_heading(tilted).abs_diff_eq(Quat::from_rotation_y(yaw), 1e-5));
+        assert_eq!(
+            level_heading(Quat::from_rotation_x(FRAC_PI_2)),
+            Quat::IDENTITY
+        );
     }
 
     #[test]

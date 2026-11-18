@@ -8,10 +8,11 @@ cube: point at it with either controller's laser and pull the trigger to swap
 the room for the first stereoscopic photo. While a photo is shown, any trigger
 click (no aiming needed) shows the next one, and after the last one you're back
 in the room. The controller buzzes on every click. Any `<name>.left.jpg` with a matching `<name>.right.jpg` in
-`assets/images/` is a stereo pair; pairs are shown in name order. They're shown
-like a stereo viewer: each eye sees its own image, fixed to your head and
-spanning the camera's field of view, so the photo is the view; the room, button and controllers
-are hidden. The field of
+`assets/images/` is a stereo pair; pairs are shown in name order. Each eye sees
+its own image, spanning the camera's field of view. A photo appears straight
+ahead and level, then stays put as you turn your head; it has no parallax when
+you move, since its depth comes only from the two images. The room, button and
+controllers are hidden. The field of
 view comes from the EXIF focal length: the 35 mm equivalent if present,
 otherwise the real focal length with an assumed 1/2" phone sensor
 (`ASSUMED_SENSOR_DIAGONAL_MM` in `src/photo.rs`). Bindings are suggested for
