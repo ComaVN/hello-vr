@@ -3,7 +3,11 @@
 //!
 //! It renders a rotating cube floating above a floor quad, plus a floating
 //! button that can be pointed at with either controller's laser and clicked
-//! with the trigger to pause or resume the cube. Both eyes are drawn
+//! with the trigger to show the first of a series of stereoscopic photos.
+//! Each photo fills the view: each eye sees its own image of a left/right
+//! pair, fixed to the head and covering the camera's field of view, as in a
+//! stereo viewer. While a photo is shown, any trigger click moves to the next
+//! one, and after the last back to the room. Both eyes are drawn
 //! in a single pass using Vulkan multiview. The shader lives in
 //! `src/shaders/scene.wgsl` and is compiled to SPIR-V at startup with naga, so
 //! no external shader compiler is required.
@@ -23,6 +27,8 @@ use ash::vk::{self, Handle};
 use glam::{Mat4, Quat, Vec3, Vec4};
 use openxr as xr;
 
+mod photo;
+
 const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_SRGB;
 const VIEW_COUNT: u32 = 2;
 const VIEW_TYPE: xr::ViewConfigurationType = xr::ViewConfigurationType::PRIMARY_STEREO;
@@ -33,6 +39,19 @@ const FAR: f32 = 100.0;
 const CUBE_VERTS: u32 = 36;
 const FLOOR_VERTS: u32 = 6;
 const TEXT_VERTS: u32 = 6;
+const PHOTO_VERTS: u32 = 6;
+
+/// Directory, relative to the crate root, searched for stereo pairs: every
+/// `<name>.left.jpg` with a matching `<name>.right.jpg`, shown in name order.
+const PHOTO_DIR: &str = "assets/images";
+
+/// A photo pair on the GPU, ready to draw.
+struct Photo {
+    texture: photo::Texture,
+    descriptor_set: vk::DescriptorSet,
+    aspect: f32,
+    long_side_fov: f32,
+}
 
 // Colour styles for cube-geometry draws, passed as the first instance and
 // matching STYLE in the shader.
@@ -165,6 +184,29 @@ fn main() -> Result<()> {
     let vert_spv = compile_wgsl(SHADER_SOURCE, naga::ShaderStage::Vertex, "vs_main")?;
     let frag_spv = compile_wgsl(SHADER_SOURCE, naga::ShaderStage::Fragment, "fs_main")?;
 
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut photo_pairs = photo::find_pairs(&root.join(PHOTO_DIR))?
+        .into_iter()
+        .map(|files| {
+            let pair = photo::load_pair(&files.left, &files.right)?;
+            println!(
+                "stereo photo {:?}: {}x{} per eye, {:.1}\u{b0} across",
+                files.name,
+                pair.width,
+                pair.height,
+                pair.long_side_fov.to_degrees()
+            );
+            Ok(pair)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Photos the button cycles through. The shader always declares the photo
+    // texture, so with none found, bind a never-shown 1x1 placeholder instead.
+    let photo_count = photo_pairs.len();
+    if photo_count == 0 {
+        eprintln!("warning: no stereo pairs (<name>.left.jpg + <name>.right.jpg) in {PHOTO_DIR}");
+        photo_pairs.push(photo::StereoPair::placeholder());
+    }
+
     // SAFETY: everything below is raw Vulkan/OpenXR FFI. Handles are created
     // in dependency order and destroyed in reverse at the end of this block.
     unsafe {
@@ -286,8 +328,28 @@ fn main() -> Result<()> {
             offset: 0,
             size: std::mem::size_of::<PushConstants>() as u32,
         }];
+        // Set 0: the stereo photo, as a separate image and sampler (WGSL has
+        // no combined image samplers).
+        let set_layout = device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(0)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(1)
+                    .descriptor_type(vk::DescriptorType::SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            ]),
+            None,
+        )?;
+        let set_layouts = [set_layout];
         let pipeline_layout = device.create_pipeline_layout(
-            &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_range),
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push_range),
             None,
         )?;
 
@@ -388,13 +450,78 @@ fn main() -> Result<()> {
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
+        // One descriptor set per photo; drawing binds the one on show.
+        let texture_count = photo_pairs.len() as u32;
+        let descriptor_pool = device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(texture_count)
+                .pool_sizes(&[
+                    vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: texture_count,
+                    },
+                    vk::DescriptorPoolSize {
+                        ty: vk::DescriptorType::SAMPLER,
+                        descriptor_count: texture_count,
+                    },
+                ]),
+            None,
+        )?;
+        let mut photos = Vec::with_capacity(photo_pairs.len());
+        for pair in photo_pairs {
+            let texture = photo::Texture::upload(
+                &vk_instance,
+                physical_device,
+                &device,
+                queue,
+                cmd_pool,
+                &pair,
+            )?;
+            let descriptor_set = device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&set_layouts),
+            )?[0];
+            let image_info = [vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: texture.view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            }];
+            let sampler_info = [vk::DescriptorImageInfo {
+                sampler: texture.sampler,
+                image_view: vk::ImageView::null(),
+                image_layout: vk::ImageLayout::UNDEFINED,
+            }];
+            device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&image_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&sampler_info),
+                ],
+                &[],
+            );
+            photos.push(Photo {
+                texture,
+                descriptor_set,
+                aspect: pair.aspect(),
+                long_side_fov: pair.long_side_fov,
+            });
+        }
+
         let mut swapchain: Option<Swapchain> = None;
         let mut event_storage = xr::EventDataBuffer::new();
         let mut session_running = false;
         let mut frame = 0usize;
-        let mut last_frame = Instant::now();
-        let mut spin_angle = 0.0f32;
-        let mut spinning = true;
+        let start = Instant::now();
+        // Index into `photos` of the photo on show, or None for the room.
+        let mut shown: Option<usize> = None;
 
         println!("entering main loop; press Ctrl-C to exit");
         'main: loop {
@@ -475,7 +602,22 @@ fn main() -> Result<()> {
             let mut hovered = false;
             let mut held = false;
             let mut pointers: Vec<(Mat4, f32)> = Vec::new();
+            // Hand whose trigger was clicked this frame, if any. At most one
+            // click counts per frame, so pressing both triggers at once
+            // doesn't skip a photo.
+            let mut clicked_hand = None;
             for hand in &input.hands {
+                let trigger = input.select.state(&session, hand.path)?;
+                let clicked = trigger.current_state && trigger.changed_since_last_sync;
+                if shown.is_some() {
+                    // A photo fills the view and has no button: any click
+                    // moves on, aimed or not, even if tracking is lost.
+                    if clicked {
+                        clicked_hand = Some(hand.path);
+                    }
+                    continue;
+                }
+
                 let location = hand
                     .aim_space
                     .locate(&stage, frame_state.predicted_display_time)?;
@@ -489,43 +631,59 @@ fn main() -> Result<()> {
                 let dir = aim.transform_vector3(Vec3::NEG_Z);
                 let hit = ray_box_hit(origin, dir, button_min, button_max);
                 pointers.push((aim, hit.unwrap_or(LASER_LENGTH)));
-
-                let trigger = input.select.state(&session, hand.path)?;
                 if hit.is_some() {
                     hovered = true;
                     held |= trigger.current_state;
-                    if trigger.current_state && trigger.changed_since_last_sync {
-                        spinning = !spinning;
-                        input.haptic.apply_feedback(
-                            &session,
-                            hand.path,
-                            &xr::HapticVibration::new()
-                                .amplitude(0.8)
-                                .duration(xr::Duration::from_nanos(50_000_000))
-                                .frequency(xr::FREQUENCY_UNSPECIFIED),
-                        )?;
+                    if clicked {
+                        clicked_hand = Some(hand.path);
                     }
                 }
             }
-
-            let now = Instant::now();
-            if spinning {
-                spin_angle += (now - last_frame).as_secs_f32();
+            if let Some(path) = clicked_hand {
+                shown = next_photo(shown, photo_count);
+                input.haptic.apply_feedback(
+                    &session,
+                    path,
+                    &xr::HapticVibration::new()
+                        .amplitude(0.8)
+                        .duration(xr::Duration::from_nanos(50_000_000))
+                        .frequency(xr::FREQUENCY_UNSPECIFIED),
+                )?;
             }
-            last_frame = now;
 
+            let t = start.elapsed().as_secs_f32();
             let push = |model: Mat4| PushConstants {
                 mvp: view_proj.map(|vp| (vp * model).to_cols_array()),
             };
             let cube_push = push(
                 Mat4::from_translation(Vec3::new(0.0, 1.5, -1.5))
-                    * Mat4::from_rotation_y(spin_angle)
-                    * Mat4::from_rotation_x(spin_angle * 0.7)
+                    * Mat4::from_rotation_y(t)
+                    * Mat4::from_rotation_x(t * 0.7)
                     * Mat4::from_scale(Vec3::splat(0.2)),
             );
             let floor_push = push(Mat4::IDENTITY);
             // Text hangs above the cube, facing the user at the origin.
             let text_push = push(Mat4::from_translation(Vec3::new(0.0, 2.05, -1.5)));
+            // The photo is fixed to the head and rotation-only, as if
+            // infinitely far away: the depth is already in the difference
+            // between the two images, so eye position must not add parallax.
+            // Each eye gets the same head-relative placement, so the two
+            // photos stay parallel like the cameras that took them.
+            let photo_push = shown.map(|i| {
+                let photo = &photos[i];
+                let eye_rotation = [pose_rotation(views[0].pose), pose_rotation(views[1].pose)];
+                let head_rotation = eye_rotation[0].slerp(eye_rotation[1], 0.5);
+                let photo_world =
+                    Mat4::from_quat(head_rotation) * photo_model(photo.aspect, photo.long_side_fov);
+                PushConstants {
+                    mvp: [0, 1].map(|eye| {
+                        (projection(views[eye].fov)
+                            * Mat4::from_quat(eye_rotation[eye].inverse())
+                            * photo_world)
+                            .to_cols_array()
+                    }),
+                }
+            });
             // While held, the button's front face sinks toward its back face.
             let press = if held { BUTTON_PRESS_DEPTH } else { 0.0 };
             let button_push = push(
@@ -576,7 +734,13 @@ fn main() -> Result<()> {
             )?;
             let clear = [vk::ClearValue {
                 color: vk::ClearColorValue {
-                    float32: [0.05, 0.05, 0.1, 1.0],
+                    // Black around the photo, so its edges read as the edge
+                    // of the view rather than a frame floating in the room.
+                    float32: if shown.is_some() {
+                        [0.0, 0.0, 0.0, 1.0]
+                    } else {
+                        [0.05, 0.05, 0.1, 1.0]
+                    },
                 },
             }];
             let extent = swapchain.resolution;
@@ -613,6 +777,16 @@ fn main() -> Result<()> {
                 }],
             );
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            // The pipeline uses set 0 even when no photo is drawn, so always
+            // bind one: the photo on show, or else the first.
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                0,
+                &[photos[shown.unwrap_or(0)].descriptor_set],
+                &[],
+            );
 
             // The first instance carries the colour style (see STYLE in the shader).
             let draw = |push: &PushConstants, first_vertex: u32, vertex_count: u32, style: u32| {
@@ -625,20 +799,30 @@ fn main() -> Result<()> {
                 );
                 device.cmd_draw(cmd, vertex_count, 1, first_vertex, style);
             };
-            // Draw order stands in for a depth buffer: floor, cube, button (in
-            // front of the cube), text, and finally the controllers and lasers,
-            // which are always closest to the user.
-            draw(&floor_push, CUBE_VERTS, FLOOR_VERTS, STYLE_NORMALS);
-            draw(&cube_push, 0, CUBE_VERTS, STYLE_NORMALS);
-            draw(&button_push, 0, CUBE_VERTS, button_style);
-            draw(
-                &text_push,
-                CUBE_VERTS + FLOOR_VERTS,
-                TEXT_VERTS,
-                STYLE_NORMALS,
-            );
-            for (push, style) in &pointer_pushes {
-                draw(push, 0, CUBE_VERTS, *style);
+            // A photo fills the whole view: no room, button or controllers.
+            // In the room, draw order stands in for a depth buffer: floor,
+            // cube, button (in front of the cube), text, and finally the
+            // controllers and lasers, which are always closest to the user.
+            if let Some(photo_push) = &photo_push {
+                draw(
+                    photo_push,
+                    CUBE_VERTS + FLOOR_VERTS + TEXT_VERTS,
+                    PHOTO_VERTS,
+                    STYLE_NORMALS,
+                );
+            } else {
+                draw(&floor_push, CUBE_VERTS, FLOOR_VERTS, STYLE_NORMALS);
+                draw(&cube_push, 0, CUBE_VERTS, STYLE_NORMALS);
+                draw(&button_push, 0, CUBE_VERTS, button_style);
+                draw(
+                    &text_push,
+                    CUBE_VERTS + FLOOR_VERTS,
+                    TEXT_VERTS,
+                    STYLE_NORMALS,
+                );
+                for (push, style) in &pointer_pushes {
+                    draw(push, 0, CUBE_VERTS, *style);
+                }
             }
 
             device.cmd_end_render_pass(cmd);
@@ -706,6 +890,11 @@ fn main() -> Result<()> {
         }
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_descriptor_pool(descriptor_pool, None);
+        device.destroy_descriptor_set_layout(set_layout, None);
+        for photo in photos {
+            photo.texture.destroy(&device);
+        }
         device.destroy_command_pool(cmd_pool, None);
         device.destroy_render_pass(render_pass, None);
         device.destroy_device(None);
@@ -944,16 +1133,39 @@ fn ray_box_hit(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     (enter <= exit && exit >= 0.0).then_some(enter.max(0.0))
 }
 
-/// Local-to-world transform for an OpenXR pose.
-fn pose_matrix(pose: xr::Posef) -> Mat4 {
-    let rotation = Quat::from_xyzw(
+/// What a button click shows after `current` (None is the room): the next
+/// photo, or the room again after the last one.
+fn next_photo(current: Option<usize>, count: usize) -> Option<usize> {
+    let next = current.map_or(0, |i| i + 1);
+    (next < count).then_some(next)
+}
+
+/// Head-relative transform for the photo quad ([-1, 1]^2 in the shader): one
+/// unit in front, sized so its edges sit at the camera's field of view.
+/// `aspect` is width / height; `long_side_fov` spans the longer of the two.
+fn photo_model(aspect: f32, long_side_fov: f32) -> Mat4 {
+    let half_long = (long_side_fov / 2.0).tan();
+    let (half_width, half_height) = if aspect >= 1.0 {
+        (half_long, half_long / aspect)
+    } else {
+        (half_long * aspect, half_long)
+    };
+    Mat4::from_translation(Vec3::NEG_Z) * Mat4::from_scale(Vec3::new(half_width, half_height, 1.0))
+}
+
+fn pose_rotation(pose: xr::Posef) -> Quat {
+    Quat::from_xyzw(
         pose.orientation.x,
         pose.orientation.y,
         pose.orientation.z,
         pose.orientation.w,
-    );
+    )
+}
+
+/// Local-to-world transform for an OpenXR pose.
+fn pose_matrix(pose: xr::Posef) -> Mat4 {
     let position = Vec3::new(pose.position.x, pose.position.y, pose.position.z);
-    Mat4::from_rotation_translation(rotation, position)
+    Mat4::from_rotation_translation(pose_rotation(pose), position)
 }
 
 /// World-to-eye transform for an OpenXR view pose.
@@ -1022,6 +1234,43 @@ mod tests {
         let dir = Vec3::new(-1.0, 0.0, -1.0).normalize();
         let hit = ray_box_hit(Vec3::new(3.0, 0.0, 3.0), dir, min, max).unwrap();
         assert!((hit - 2.0 * 2f32.sqrt()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn photo_edges_sit_at_camera_field_of_view() {
+        let (aspect, fov) = (4.0 / 3.0, 80f32.to_radians());
+        let model = photo_model(aspect, fov);
+        let right = model.transform_point3(Vec3::X);
+        let top = model.transform_point3(Vec3::Y);
+        assert!((right.x.atan2(-right.z) - fov / 2.0).abs() < 1e-5);
+        let half_v = top.y.atan2(-top.z);
+        assert!(((half_v.tan() * aspect) - (fov / 2.0).tan()).abs() < 1e-5);
+        assert!(
+            model
+                .transform_point3(Vec3::ZERO)
+                .abs_diff_eq(Vec3::NEG_Z, 1e-6)
+        );
+    }
+
+    #[test]
+    fn portrait_photo_spans_fov_vertically() {
+        let (aspect, fov) = (3.0 / 4.0, 60f32.to_radians());
+        let model = photo_model(aspect, fov);
+        let right = model.transform_point3(Vec3::X);
+        let top = model.transform_point3(Vec3::Y);
+        assert!((top.y.atan2(-top.z) - fov / 2.0).abs() < 1e-5);
+        assert!((right.x / top.y - aspect).abs() < 1e-5);
+    }
+
+    #[test]
+    fn clicks_cycle_through_photos_and_back_to_the_room() {
+        let mut shown = None;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            shown = next_photo(shown, 3);
+            seen.push(shown);
+        }
+        assert_eq!(seen, [Some(0), Some(1), Some(2), None]);
     }
 
     #[test]

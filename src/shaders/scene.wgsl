@@ -1,7 +1,8 @@
 // Hello-VR scene: a rotating cube above a floor quad, with "Hello, World!"
 // floating above it. All geometry is generated from the vertex index, so no
 // vertex buffers are needed, and the text is drawn from a bitmap font baked
-// into the fragment shader, so no textures or descriptor sets are needed.
+// into the fragment shader. The only texture is the stereo photo pair: a
+// two-layer array whose layer is chosen by eye, so each eye sees its own photo.
 // Multiview renders both eyes in one pass; `view_index` selects the eye.
 // The cube geometry is reused for the button, controllers and laser pointers;
 // the draw's first instance (`instance_index`) picks their colour from STYLE,
@@ -14,12 +15,18 @@ struct Push {
 
 var<immediate> pc: Push;
 
+// Stereo photo: layer 0 is the left eye's image, layer 1 the right eye's.
+@group(0) @binding(0) var photo: texture_2d_array<f32>;
+@group(0) @binding(1) var photo_sampler: sampler;
+
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) color: vec3<f32>,
     @location(1) uv: vec2<f32>,
-    // 0 = solid colour, 1 = text.
+    // 0 = solid colour, 1 = text, 2 = photo.
     @location(2) @interpolate(flat) kind: u32,
+    // Which eye is being drawn, for picking the photo layer.
+    @location(3) @interpolate(flat) eye: u32,
 }
 
 // Two CCW triangles covering [-1, 1]^2.
@@ -61,6 +68,8 @@ const STYLE = array<vec3<f32>, 6>(
 const CUBE_VERTS: u32 = 36u;
 const FLOOR_VERTS: u32 = 6u;
 const TEXT_START: u32 = CUBE_VERTS + FLOOR_VERTS;
+const TEXT_VERTS: u32 = 6u;
+const PHOTO_START: u32 = TEXT_START + TEXT_VERTS;
 
 // Text layout: 5x7 pixel glyphs in 6x7 cells (one column of spacing).
 const TEXT_LEN: u32 = 13u;
@@ -133,6 +142,14 @@ fn vs_main(
         let q = quad[(vi - CUBE_VERTS) % 6u];
         position = vec3(q.x * 2.0, 0.0, -q.y * 2.0);
         out.color = vec3(0.25, 0.25, 0.3);
+    } else if vi >= PHOTO_START {
+        // Photo: [-1, 1]^2 quad in the XY plane facing +Z; the model matrix
+        // scales it to the photo's aspect ratio.
+        let q = quad[(vi - PHOTO_START) % 6u];
+        position = vec3(q.x, q.y, 0.0);
+        out.uv = q * 0.5 + vec2(0.5);
+        out.color = vec3(1.0);
+        out.kind = 2u;
     } else {
         // Text: quad in the XY plane facing +Z, toward the user.
         let q = quad[(vi - TEXT_START) % 6u];
@@ -142,12 +159,20 @@ fn vs_main(
         out.kind = 1u;
     }
 
+    out.eye = view;
     out.pos = pc.mvp[view] * vec4(position, 1.0);
     return out;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if in.kind == 2u {
+        // Image rows run top to bottom, uv.y bottom to top. An explicit LOD
+        // because implicit derivatives aren't allowed in non-uniform control
+        // flow, and the texture has a single mip level anyway.
+        let uv = vec2(in.uv.x, 1.0 - in.uv.y);
+        return textureSampleLevel(photo, photo_sampler, uv, in.eye, 0.0);
+    }
     if in.kind == 1u {
         var text = TEXT;
         var font = FONT;

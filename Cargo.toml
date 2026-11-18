@@ -8,5 +8,12 @@ anyhow = "1.0"
 ash = "0.38"
 ctrlc = "3"
 glam = "0.34"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+kamadak-exif = "0.6.2"
 naga = { version = "30", features = ["wgsl-in", "spv-out"] }
 openxr = { version = "0.22", features = ["loaded"] }
+
+# Decoding the 12 MP stereo photos takes seconds without optimisation, so
+# optimise dependencies even in dev and test builds.
+[profile.dev.package."*"]
+opt-level = 3
