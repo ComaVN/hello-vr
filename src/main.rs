@@ -1,7 +1,9 @@
 //! Minimal OpenXR + Vulkan "hello world" for SteamVR, written against the
 //! `openxr` and `ash` crates.
 //!
-//! It renders a rotating cube floating above a floor quad. Both eyes are drawn
+//! It renders a rotating cube floating above a floor quad, plus a floating
+//! button that can be pointed at with either controller's laser and clicked
+//! with the trigger to pause or resume the cube. Both eyes are drawn
 //! in a single pass using Vulkan multiview. The shader lives in
 //! `src/shaders/scene.wgsl` and is compiled to SPIR-V at startup with naga, so
 //! no external shader compiler is required.
@@ -31,6 +33,25 @@ const FAR: f32 = 100.0;
 const CUBE_VERTS: u32 = 36;
 const FLOOR_VERTS: u32 = 6;
 const TEXT_VERTS: u32 = 6;
+
+// Colour styles for cube-geometry draws, passed as the first instance and
+// matching STYLE in the shader.
+const STYLE_NORMALS: u32 = 0;
+const STYLE_BUTTON_IDLE: u32 = 1;
+const STYLE_BUTTON_HOVER: u32 = 2;
+const STYLE_BUTTON_PRESSED: u32 = 3;
+const STYLE_LASER: u32 = 4;
+const STYLE_CONTROLLER: u32 = 5;
+
+/// Centre of the floating button in STAGE space: in front of and below the cube.
+const BUTTON_CENTER: Vec3 = Vec3::new(0.0, 1.0, -1.0);
+/// Half extents of the button box; it faces +Z, toward the user.
+const BUTTON_HALF_EXTENTS: Vec3 = Vec3::new(0.1, 0.1, 0.03);
+/// How far the button face sinks while it is held down.
+const BUTTON_PRESS_DEPTH: f32 = 0.02;
+/// Length of the laser when it does not hit the button.
+const LASER_LENGTH: f32 = 3.0;
+const LASER_RADIUS: f32 = 0.002;
 
 const SHADER_SOURCE: &str = include_str!("shaders/scene.wgsl");
 
@@ -63,6 +84,21 @@ struct Swapchain {
 struct Framebuffer {
     framebuffer: vk::Framebuffer,
     color: vk::ImageView,
+}
+
+/// Controller input: a pointing pose, a trigger and haptics for each hand.
+struct Input {
+    action_set: xr::ActionSet,
+    select: xr::Action<bool>,
+    haptic: xr::Action<xr::Haptic>,
+    // Kept alive for the spaces created from it.
+    _aim: xr::Action<xr::Posef>,
+    hands: [Hand; 2],
+}
+
+struct Hand {
+    path: xr::Path,
+    aim_space: xr::Space,
 }
 
 fn main() -> Result<()> {
@@ -327,6 +363,7 @@ fn main() -> Result<()> {
         // STAGE space puts the origin on the floor at the centre of the play area.
         let stage =
             session.create_reference_space(xr::ReferenceSpaceType::STAGE, xr::Posef::IDENTITY)?;
+        let input = create_input(&xr_instance, &session)?;
 
         let cmd_pool = device.create_command_pool(
             &vk::CommandPoolCreateInfo::default()
@@ -355,7 +392,9 @@ fn main() -> Result<()> {
         let mut event_storage = xr::EventDataBuffer::new();
         let mut session_running = false;
         let mut frame = 0usize;
-        let start = Instant::now();
+        let mut last_frame = Instant::now();
+        let mut spin_angle = 0.0f32;
+        let mut spinning = true;
 
         println!("entering main loop; press Ctrl-C to exit");
         'main: loop {
@@ -400,6 +439,9 @@ fn main() -> Result<()> {
 
             let frame_state = frame_wait.wait()?;
             frame_stream.begin()?;
+            // Returns XR_SESSION_NOT_FOCUSED (a success code) while another app
+            // has input focus; the actions then simply report inactive.
+            session.sync_actions(&[xr::ActiveActionSet::new(&input.action_set)])?;
 
             if !frame_state.should_render {
                 frame_stream.end(frame_state.predicted_display_time, blend_mode, &[])?;
@@ -426,22 +468,102 @@ fn main() -> Result<()> {
                 projection(views[1].fov) * view_matrix(views[1].pose),
             ];
 
-            let t = start.elapsed().as_secs_f32();
-            let cube_model = Mat4::from_translation(Vec3::new(0.0, 1.5, -1.5))
-                * Mat4::from_rotation_y(t)
-                * Mat4::from_rotation_x(t * 0.7)
-                * Mat4::from_scale(Vec3::splat(0.2));
-            let cube_push = PushConstants {
-                mvp: view_proj.map(|vp| (vp * cube_model).to_cols_array()),
+            // Point each controller's aim ray at the button. A trigger press
+            // that starts while the ray is on the button counts as a click.
+            let button_min = BUTTON_CENTER - BUTTON_HALF_EXTENTS;
+            let button_max = BUTTON_CENTER + BUTTON_HALF_EXTENTS;
+            let mut hovered = false;
+            let mut held = false;
+            let mut pointers: Vec<(Mat4, f32)> = Vec::new();
+            for hand in &input.hands {
+                let location = hand
+                    .aim_space
+                    .locate(&stage, frame_state.predicted_display_time)?;
+                let valid = xr::SpaceLocationFlags::POSITION_VALID
+                    | xr::SpaceLocationFlags::ORIENTATION_VALID;
+                if !location.location_flags.contains(valid) {
+                    continue;
+                }
+                let aim = pose_matrix(location.pose);
+                let origin = aim.transform_point3(Vec3::ZERO);
+                let dir = aim.transform_vector3(Vec3::NEG_Z);
+                let hit = ray_box_hit(origin, dir, button_min, button_max);
+                pointers.push((aim, hit.unwrap_or(LASER_LENGTH)));
+
+                let trigger = input.select.state(&session, hand.path)?;
+                if hit.is_some() {
+                    hovered = true;
+                    held |= trigger.current_state;
+                    if trigger.current_state && trigger.changed_since_last_sync {
+                        spinning = !spinning;
+                        input.haptic.apply_feedback(
+                            &session,
+                            hand.path,
+                            &xr::HapticVibration::new()
+                                .amplitude(0.8)
+                                .duration(xr::Duration::from_nanos(50_000_000))
+                                .frequency(xr::FREQUENCY_UNSPECIFIED),
+                        )?;
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            if spinning {
+                spin_angle += (now - last_frame).as_secs_f32();
+            }
+            last_frame = now;
+
+            let push = |model: Mat4| PushConstants {
+                mvp: view_proj.map(|vp| (vp * model).to_cols_array()),
             };
-            let floor_push = PushConstants {
-                mvp: view_proj.map(|vp| vp.to_cols_array()),
-            };
+            let cube_push = push(
+                Mat4::from_translation(Vec3::new(0.0, 1.5, -1.5))
+                    * Mat4::from_rotation_y(spin_angle)
+                    * Mat4::from_rotation_x(spin_angle * 0.7)
+                    * Mat4::from_scale(Vec3::splat(0.2)),
+            );
+            let floor_push = push(Mat4::IDENTITY);
             // Text hangs above the cube, facing the user at the origin.
-            let text_model = Mat4::from_translation(Vec3::new(0.0, 2.05, -1.5));
-            let text_push = PushConstants {
-                mvp: view_proj.map(|vp| (vp * text_model).to_cols_array()),
+            let text_push = push(Mat4::from_translation(Vec3::new(0.0, 2.05, -1.5)));
+            // While held, the button's front face sinks toward its back face.
+            let press = if held { BUTTON_PRESS_DEPTH } else { 0.0 };
+            let button_push = push(
+                Mat4::from_translation(BUTTON_CENTER - Vec3::Z * (press / 2.0))
+                    * Mat4::from_scale(BUTTON_HALF_EXTENTS - Vec3::Z * (press / 2.0)),
+            );
+            let button_style = match (hovered, held) {
+                (_, true) => STYLE_BUTTON_PRESSED,
+                (true, false) => STYLE_BUTTON_HOVER,
+                (false, false) => STYLE_BUTTON_IDLE,
             };
+            // A small box for each controller body and a thin one for its
+            // laser, which stops where it hits the button.
+            let pointer_pushes: Vec<(PushConstants, u32)> = pointers
+                .iter()
+                .flat_map(|&(aim, length)| {
+                    [
+                        (
+                            push(
+                                aim * Mat4::from_translation(Vec3::new(0.0, 0.0, 0.05))
+                                    * Mat4::from_scale(Vec3::new(0.02, 0.02, 0.05)),
+                            ),
+                            STYLE_CONTROLLER,
+                        ),
+                        (
+                            push(
+                                aim * Mat4::from_translation(Vec3::new(0.0, 0.0, -length / 2.0))
+                                    * Mat4::from_scale(Vec3::new(
+                                        LASER_RADIUS,
+                                        LASER_RADIUS,
+                                        length / 2.0,
+                                    )),
+                            ),
+                            STYLE_LASER,
+                        ),
+                    ]
+                })
+                .collect();
 
             device.wait_for_fences(&[fences[frame]], true, u64::MAX)?;
             device.reset_fences(&[fences[frame]])?;
@@ -492,31 +614,32 @@ fn main() -> Result<()> {
             );
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
-            // Draw order stands in for a depth buffer: floor, then cube, then text.
-            device.cmd_push_constants(
-                cmd,
-                pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                floor_push.as_bytes(),
+            // The first instance carries the colour style (see STYLE in the shader).
+            let draw = |push: &PushConstants, first_vertex: u32, vertex_count: u32, style: u32| {
+                device.cmd_push_constants(
+                    cmd,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    push.as_bytes(),
+                );
+                device.cmd_draw(cmd, vertex_count, 1, first_vertex, style);
+            };
+            // Draw order stands in for a depth buffer: floor, cube, button (in
+            // front of the cube), text, and finally the controllers and lasers,
+            // which are always closest to the user.
+            draw(&floor_push, CUBE_VERTS, FLOOR_VERTS, STYLE_NORMALS);
+            draw(&cube_push, 0, CUBE_VERTS, STYLE_NORMALS);
+            draw(&button_push, 0, CUBE_VERTS, button_style);
+            draw(
+                &text_push,
+                CUBE_VERTS + FLOOR_VERTS,
+                TEXT_VERTS,
+                STYLE_NORMALS,
             );
-            device.cmd_draw(cmd, FLOOR_VERTS, 1, CUBE_VERTS, 0);
-            device.cmd_push_constants(
-                cmd,
-                pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                cube_push.as_bytes(),
-            );
-            device.cmd_draw(cmd, CUBE_VERTS, 1, 0, 0);
-            device.cmd_push_constants(
-                cmd,
-                pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                text_push.as_bytes(),
-            );
-            device.cmd_draw(cmd, TEXT_VERTS, 1, CUBE_VERTS + FLOOR_VERTS, 0);
+            for (push, style) in &pointer_pushes {
+                draw(push, 0, CUBE_VERTS, *style);
+            }
 
             device.cmd_end_render_pass(cmd);
             device.end_command_buffer(cmd)?;
@@ -568,7 +691,7 @@ fn main() -> Result<()> {
         }
 
         // OpenXR objects must go before the Vulkan objects they reference.
-        drop((session, frame_wait, frame_stream, stage));
+        drop((input, session, frame_wait, frame_stream, stage));
 
         device.wait_for_fences(&fences, true, u64::MAX)?;
         for fence in fences {
@@ -734,8 +857,95 @@ unsafe fn create_swapchain(
     })
 }
 
-/// World-to-eye transform for an OpenXR view pose.
-fn view_matrix(pose: xr::Posef) -> Mat4 {
+/// Create the controller actions, suggest bindings for common controllers and
+/// attach them to the session. Must run before the session's first sync.
+fn create_input(instance: &xr::Instance, session: &xr::Session<xr::Vulkan>) -> Result<Input> {
+    let path = |s: &str| {
+        instance
+            .string_to_path(s)
+            .with_context(|| format!("xrStringToPath({s})"))
+    };
+    let hand_paths = [path("/user/hand/left")?, path("/user/hand/right")?];
+
+    let action_set = instance.create_action_set("gameplay", "Gameplay", 0)?;
+    let aim = action_set.create_action::<xr::Posef>("aim", "Aim", &hand_paths)?;
+    let select = action_set.create_action::<bool>("select", "Select", &hand_paths)?;
+    let haptic = action_set.create_action::<xr::Haptic>("haptic", "Haptic", &hand_paths)?;
+
+    // Each profile names the input that acts as the trigger. Float inputs
+    // such as trigger/value are converted to a boolean by the runtime.
+    let profiles = [
+        (
+            "/interaction_profiles/khr/simple_controller",
+            "select/click",
+        ),
+        (
+            "/interaction_profiles/valve/index_controller",
+            "trigger/click",
+        ),
+        ("/interaction_profiles/htc/vive_controller", "trigger/click"),
+        (
+            "/interaction_profiles/oculus/touch_controller",
+            "trigger/value",
+        ),
+    ];
+    for (profile, trigger) in profiles {
+        let mut bindings = Vec::new();
+        for hand in ["left", "right"] {
+            let prefix = format!("/user/hand/{hand}");
+            bindings.push(xr::Binding::new(
+                &aim,
+                path(&format!("{prefix}/input/aim/pose"))?,
+            ));
+            bindings.push(xr::Binding::new(
+                &select,
+                path(&format!("{prefix}/input/{trigger}"))?,
+            ));
+            bindings.push(xr::Binding::new(
+                &haptic,
+                path(&format!("{prefix}/output/haptic"))?,
+            ));
+        }
+        // One unsupported profile should not stop the others from working.
+        if let Err(e) = instance.suggest_interaction_profile_bindings(path(profile)?, &bindings) {
+            eprintln!("warning: could not suggest bindings for {profile}: {e}");
+        }
+    }
+
+    session.attach_action_sets(&[&action_set])?;
+
+    let hand = |path| -> Result<Hand> {
+        Ok(Hand {
+            path,
+            aim_space: aim.create_space(session, path, xr::Posef::IDENTITY)?,
+        })
+    };
+    let hands = [hand(hand_paths[0])?, hand(hand_paths[1])?];
+    Ok(Input {
+        action_set,
+        select,
+        haptic,
+        _aim: aim,
+        hands,
+    })
+}
+
+/// Distance along a ray to where it first touches an axis-aligned box, or
+/// `None` if it misses or the box is entirely behind the origin. An origin
+/// inside the box gives 0.
+fn ray_box_hit(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
+    // Slab test. A zero direction component gives infinite slab distances,
+    // which accept or reject that axis (barring an origin exactly on a face).
+    let inv = dir.recip();
+    let t1 = (min - origin) * inv;
+    let t2 = (max - origin) * inv;
+    let enter = t1.min(t2).max_element();
+    let exit = t1.max(t2).min_element();
+    (enter <= exit && exit >= 0.0).then_some(enter.max(0.0))
+}
+
+/// Local-to-world transform for an OpenXR pose.
+fn pose_matrix(pose: xr::Posef) -> Mat4 {
     let rotation = Quat::from_xyzw(
         pose.orientation.x,
         pose.orientation.y,
@@ -743,7 +953,12 @@ fn view_matrix(pose: xr::Posef) -> Mat4 {
         pose.orientation.w,
     );
     let position = Vec3::new(pose.position.x, pose.position.y, pose.position.z);
-    Mat4::from_rotation_translation(rotation, position).inverse()
+    Mat4::from_rotation_translation(rotation, position)
+}
+
+/// World-to-eye transform for an OpenXR view pose.
+fn view_matrix(pose: xr::Posef) -> Mat4 {
+    pose_matrix(pose).inverse()
 }
 
 /// Asymmetric off-axis projection for an OpenXR field of view, using Vulkan
@@ -783,6 +998,30 @@ mod tests {
     #[test]
     fn push_constants_fit_vulkan_minimum() {
         assert!(std::mem::size_of::<PushConstants>() <= 128);
+    }
+
+    #[test]
+    fn ray_box_hit_reports_entry_distance() {
+        let (min, max) = (Vec3::splat(-1.0), Vec3::splat(1.0));
+        // Straight at the box from 5 m away along +Z.
+        let hit = ray_box_hit(Vec3::new(0.0, 0.0, 5.0), Vec3::NEG_Z, min, max);
+        assert!((hit.unwrap() - 4.0).abs() < 1e-5);
+        // Pointing away from it.
+        assert_eq!(
+            ray_box_hit(Vec3::new(0.0, 0.0, 5.0), Vec3::Z, min, max),
+            None
+        );
+        // Passing beside it, parallel to an axis.
+        assert_eq!(
+            ray_box_hit(Vec3::new(2.0, 0.0, 5.0), Vec3::NEG_Z, min, max),
+            None
+        );
+        // Starting inside.
+        assert_eq!(ray_box_hit(Vec3::ZERO, Vec3::X, min, max), Some(0.0));
+        // At an angle.
+        let dir = Vec3::new(-1.0, 0.0, -1.0).normalize();
+        let hit = ray_box_hit(Vec3::new(3.0, 0.0, 3.0), dir, min, max).unwrap();
+        assert!((hit - 2.0 * 2f32.sqrt()).abs() < 1e-5);
     }
 
     #[test]

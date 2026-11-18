@@ -3,6 +3,9 @@
 // vertex buffers are needed, and the text is drawn from a bitmap font baked
 // into the fragment shader, so no textures or descriptor sets are needed.
 // Multiview renders both eyes in one pass; `view_index` selects the eye.
+// The cube geometry is reused for the button, controllers and laser pointers;
+// the draw's first instance (`instance_index`) picks their colour from STYLE,
+// so the push constants stay within Vulkan's guaranteed 128 bytes.
 
 struct Push {
     // Per-eye (projection * view * model) matrices.
@@ -41,6 +44,18 @@ const BITANGENT = array<vec3<f32>, 6>(
     vec3(0.0, 1.0, 0.0), vec3(0.0, 1.0, 0.0),
     vec3(0.0, 0.0, -1.0), vec3(0.0, 0.0, 1.0),
     vec3(0.0, 1.0, 0.0), vec3(0.0, 1.0, 0.0),
+);
+
+// Flat colours for cube geometry, indexed by instance_index. Entry 0 means
+// "use the normal as colour", which gives the spinning cube its rainbow faces.
+// Must match the STYLE_* constants in main.rs.
+const STYLE = array<vec3<f32>, 6>(
+    vec3(0.0),              // 0: normal colours
+    vec3(0.80, 0.15, 0.15), // 1: button, idle
+    vec3(1.00, 0.45, 0.35), // 2: button, hovered
+    vec3(0.45, 0.05, 0.05), // 3: button, pressed
+    vec3(0.30, 0.80, 1.00), // 4: laser pointer
+    vec3(0.55, 0.55, 0.60), // 5: controller
 );
 
 const CUBE_VERTS: u32 = 36u;
@@ -88,8 +103,10 @@ const FONT = array<u32, 70>(
 fn vs_main(
     @builtin(vertex_index) vi: u32,
     @builtin(view_index) view: u32,
+    @builtin(instance_index) style: u32,
 ) -> VsOut {
     var quad = QUAD;
+    var palette = STYLE;
     var normal = NORMAL;
     var tangent = TANGENT;
     var bitangent = BITANGENT;
@@ -104,7 +121,13 @@ fn vs_main(
         let q = quad[vi % 6u];
         let n = normal[face];
         position = n + q.x * tangent[face] + q.y * bitangent[face];
-        out.color = n * 0.5 + vec3(0.5);
+        if style == 0u {
+            out.color = n * 0.5 + vec3(0.5);
+        } else {
+            // Cheap fixed-direction shading so the box faces are distinguishable.
+            let light = 0.7 + 0.3 * dot(n, normalize(vec3(0.3, 0.8, 0.5)));
+            out.color = palette[min(style, 5u)] * light;
+        }
     } else if vi < TEXT_START {
         // Floor: 4 m x 4 m quad on y = 0, facing +Y.
         let q = quad[(vi - CUBE_VERTS) % 6u];

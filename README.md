@@ -3,7 +3,10 @@
 Minimal OpenXR "hello world" for SteamVR, written in Rust with the
 [`openxr`](https://crates.io/crates/openxr) and [`ash`](https://crates.io/crates/ash) crates.
 It renders a rotating cube above a floor quad with "Hello, World!" floating above it,
-both eyes in one pass via Vulkan multiview. The text comes from a 5x7 bitmap font baked
+both eyes in one pass via Vulkan multiview. A red button floats in front of the
+cube: point at it with either controller's laser and pull the trigger to pause
+or resume the cube (the controller buzzes on click). Bindings are suggested for
+the Khronos simple controller, Valve Index, HTC Vive and Oculus Touch profiles. The text comes from a 5x7 bitmap font baked
 into the fragment shader, so there are no textures, fonts or descriptor sets.
 
 ## Requirements
